@@ -42,27 +42,77 @@ CLAUDE_MANAGED_ENVIRONMENT_ID=your_environment_id
 PORT=3048
 ```
 
-## How the application was developed
+## How the app was build
 
-The browser collects inputs; the Node host validates requests; the lesson implementation produces observable evidence. The architecture page walks through the real source with numbered steps, prerequisite configuration, source filenames and code excerpts.
+### 1. Advance host-owned stages in a fixed order
 
-### Lesson implementation
+The architect, developer and reviewer stages are predetermined by the host. A paused stage returns immediately, keeping downstream stages out of the completed report list.
 
-[src/lesson.ts](https://github.com/luiscoco/Udemy-claude-managed-agents-lesson-c48-app/blob/main/src/lesson.ts)
+Source: [src/lesson.ts](src/lesson.ts#L13) · selected statements
 
 ```typescript
-  async run(input) {
+const stages = ["architect", "developer", "reviewer"],
+  completed: Input[] = [];
 
-const stages=["architect","developer","reviewer"], completed:Input[]=[];
-for(const stage of stages){if(stage===text(input,"pauseStage"))return report("paused","A stage paused; downstream work was not admitted",{stagesCompleted:completed.length,reports:completed,pausedStage:stage},["Bind the stage to task and revision","Stop at an uncompleted handoff"]);completed.push({stage,taskId:"task-demo",revision:"rev-1",summary:`${stage} authored report`});}
-const approved=flag(input,"reviewApproved");
-return report(approved?"passed":"rejected",approved?"Host workflow reached its review gate":"Reviewer rejected the candidate",{stagesCompleted:completed.length,reports:completed,accepted:approved},["Run architect before developer","Validate each stage report","Do not treat handoff text as shared filesystem state","Require the independent acceptance gate"]);
-
-  }
-};
+for (const stage of stages) {
+  if (stage === text(input, "pauseStage"))
+    return report(
+      "paused",
+      "A stage paused; downstream work was not admitted",
+      { stagesCompleted: completed.length, reports: completed, pausedStage: stage },
+      ["Bind the stage to task and revision", "Stop at an uncompleted handoff"],
+    );
+  completed.push({
+    stage,
+    taskId: "task-demo",
+    revision: "rev-1",
+    summary: `${stage} authored report`,
+  });
+}
 ```
 
-Read the architecture page for the remaining source excerpts and explanations, including input handling and optional provider behavior. The diagram describes this application, rather than implying that an external integration has been implemented.
+### 2. Require the final acceptance gate
+
+Completing the authored stages is insufficient when reviewApproved is false. The report retains task/revision bindings and stage results; no model-based router or real shared workspace is started.
+
+Source: [src/lesson.ts](src/lesson.ts#L15) · selected statements
+
+```typescript
+const approved = flag(input, "reviewApproved");
+
+return report(
+  approved ? "passed" : "rejected",
+  approved
+    ? "Host workflow reached its review gate"
+    : "Reviewer rejected the candidate",
+  { stagesCompleted: completed.length, reports: completed, accepted: approved },
+  [
+    "Run architect before developer",
+    "Validate each stage report",
+    "Do not treat handoff text as shared filesystem state",
+    "Require the independent acceptance gate",
+  ],
+);
+```
+
+### Check your understanding
+
+Run **Complete the three-stage workflow** in the application. Compare the result with these scenario expectations:
+
+```json
+{
+  "input": {
+    "pauseStage": "none",
+    "reviewApproved": true
+  },
+  "expectedOutcome": "passed",
+  "checkEvidence": {
+    "stagesCompleted": 3
+  }
+}
+```
+
+Then try **Stop at a developer pause**. Its expected outcome is `paused`; identify the condition or evidence field that explains the difference.
 
 ## Validation
 
