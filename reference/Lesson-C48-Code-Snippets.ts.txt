@@ -1,0 +1,112 @@
+// Host-owned three-stage teaching workflow. No live calls run at module load.
+import { z } from "zod";
+import type Anthropic from "@anthropic-ai/sdk";
+import type { BetaManagedAgentsStreamSessionEvents as Event } from "@anthropic-ai/sdk/resources/beta/sessions/events";
+export const STAGES = ["architect", "developer", "reviewer"] as const;
+type Stage = typeof STAGES[number];
+const Revision = z.string().regex(/^[a-f0-9]{64}$/);
+const Job = z.strictObject({ taskId: z.string().min(1).max(100), goal: z.string().min(1).max(2000),
+  artifactRevision: Revision });
+export const StageReport = z.strictObject({ stage: z.enum(STAGES), taskId: z.string().min(1),
+  inputRevision: Revision, outputRevision: Revision, verdict: z.enum(["pass", "revise"]),
+  summary: z.string().min(1).max(1000), evidenceIds: z.array(z.string().min(1)).min(1).max(8) });
+export type Handoff = z.infer<typeof Job> & { previousSummary: string };
+export type StageResult = { kind: "end_turn"; reportText: string } |
+  { kind: "blocked" | "failed" | "incomplete"; reason: string };
+export type Runner = (stage: Stage, handoff: Handoff) => Promise<StageResult>;
+export type WorkflowState = { phase: "planned" | "running" | "blocked" | "failed" | "incomplete" |
+  "needs_revision" | "completed"; acceptedStages: Stage[]; reason?: string; revision?: string };
+export async function runWorkflow(rawJob: unknown, run: Runner,
+  verify: (report: z.infer<typeof StageReport>) => Promise<boolean>, state: WorkflowState) {
+  if (state.phase !== "planned") throw new Error("Workflow already claimed");
+  const job = Job.parse(rawJob);
+  state.phase = "running"; // In-process claim; production needs a durable atomic transition.
+  let handoff: Handoff = { ...job, previousSummary: "" };
+  try {
+    for (const stage of STAGES) { // Exactly three host stage slots; no automatic retry loop.
+      const result = await run(stage, structuredClone(handoff));
+      if (result.kind !== "end_turn") {
+        state.phase = result.kind; state.reason = result.reason; return state;
+      }
+      const report = StageReport.parse(JSON.parse(result.reportText));
+      if (report.stage !== stage || report.taskId !== job.taskId ||
+          report.inputRevision !== handoff.artifactRevision ||
+          (stage !== "developer" && report.outputRevision !== handoff.artifactRevision))
+        throw new Error("Foreign, stale or invalid stage handoff");
+      if (report.verdict !== "pass") { state.phase = "needs_revision"; return state; }
+      if (!await verify(structuredClone(report))) throw new Error("Independent stage gate failed");
+      state.acceptedStages.push(stage);
+      state.revision = report.outputRevision;
+      handoff = { ...job, artifactRevision: report.outputRevision, previousSummary: report.summary };
+    }
+    state.phase = "completed";
+  } catch { state.phase = "failed"; state.reason = "Stage validation or verification failed"; }
+  return state;
+}
+// Read canonical messages; retain the latest report rather than concatenating
+// all independent agent messages into an invalid or ambiguous handoff.
+export async function readStage(events: AsyncIterable<Event>): Promise<StageResult> {
+  let latest = "", count = 0;
+  for await (const event of events) {
+    if (++count > 300) return { kind: "incomplete", reason: "Event limit" };
+    if (event.type === "agent.message") {
+      latest = event.content.filter(b => b.type === "text").map(b => b.text).join("");
+      if (latest.length > 12000) return { kind: "failed", reason: "Report too large" };
+    }
+    if (event.type === "session.error" || event.type === "session.status_terminated")
+      return { kind: "failed", reason: "Provider failure or termination" };
+    if (event.type === "session.status_idle") {
+      if (event.stop_reason.type === "end_turn")
+        return latest ? { kind: "end_turn", reportText: latest } : { kind: "failed", reason: "Missing report" };
+      if (event.stop_reason.type === "requires_action" || event.stop_reason.type === "budget_reached")
+        return { kind: "blocked", reason: event.stop_reason.type };
+      return { kind: "failed", reason: event.stop_reason.type };
+    }
+  }
+  return { kind: "incomplete", reason: "Stream ended without turn evidence" };
+}
+const Agent = z.strictObject({ id: z.string().min(1), version: z.number().int().positive() });
+const Configuration = z.strictObject({ environmentId: z.string().min(1),
+  architect: Agent, developer: Agent, reviewer: Agent });
+export type SessionRecord = { stage: Stage; sessionId?: string; phase: "creating" | "created" |
+  "observing" | "end_turn" | "blocked" | "failed" | "incomplete" | "uncertain" };
+export function managedRunner(client: Anthropic, trustedConfig: unknown, ledger: SessionRecord[]): Runner {
+  const config = Configuration.parse(trustedConfig);
+  return async (stage, handoff) => {
+    const record: SessionRecord = { stage, phase: "creating" }; ledger.push(record);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60000);
+    let stopStream: (() => void) | undefined;
+    try {
+      const session = await client.beta.sessions.create({
+        agent: { type: "agent", ...config[stage] }, environment_id: config.environmentId,
+        metadata: { task_id: handoff.taskId, host_stage: stage },
+        budget: { type: "limit", max_list_cost: { amount: "20", currency: "USD" } }
+      }, { maxRetries: 0, timeout: 10000, signal: controller.signal });
+      record.sessionId = session.id; record.phase = "created";
+      // Persist the new ID before further work in a production ledger.
+      const stream = await client.beta.sessions.events.stream(session.id, {},
+        { timeout: 60000, signal: controller.signal });
+      stopStream = () => stream.controller.abort();
+      await client.beta.sessions.events.send(session.id, { events: [{ type: "user.message",
+        content: [{ type: "text", text: JSON.stringify({ stage, ...handoff }) }] }]
+      }, { maxRetries: 0, timeout: 10000, signal: controller.signal });
+      record.phase = "observing";
+      const result = await readStage(stream);
+      record.phase = result.kind;
+      return result;
+    } catch {
+      record.phase = "uncertain";
+      return { kind: "incomplete", reason: "Provider delivery/observation uncertain; reconcile ledger" };
+    } finally { clearTimeout(timer); stopStream?.(); }
+  };
+}
+// Required host controls beyond this example: authorize task/config/resources,
+// pin agents with reviewed native delegation disabled for the intended three-stage
+// topology, provide approved artifact bytes to each new session, and make verifier
+// evidence independently authoritative. Text handoff is not filesystem transfer.
+// Production needs durable checkpoints/atomic claims, quota reservations and a
+// bounded explicit resume policy. Local abort/stream close is not remote cleanup.
+// Three 20-cent caps are 60 nominal list cents, not an exact global invoice cap;
+// admitted work can exceed a cap. Separate sessions do not inherit parent state.
+// Fixed routing does not make model outputs deterministic or guarantee safety.
